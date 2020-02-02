@@ -1,9 +1,8 @@
 import torch
 import numpy as np
 
-from inverter_util import RelevancePropagator
-from utils import pprint, Flatten
-
+from .modules import ALLOWED_LAYERS, ALLOWED_LAYERS_BY_NAME, ALLOWED_PASS_LAYERS, \
+    AVAILABLE_METHODS, LRPPassLayer, Flatten
 
 class InnvestigateModel(torch.nn.Module):
     """
@@ -15,7 +14,7 @@ class InnvestigateModel(torch.nn.Module):
     """
 
     def __init__(self, the_model, lrp_exponent=1, beta=.5, epsilon=1e-6,
-                 method="e-rule"):
+                 method="e-rule", ignore_unsupported_layers=False):
         """
         Model wrapper for pytorch models to 'innvestigate' them
         with layer-wise relevance propagation (LRP) as introduced by Bach et. al
@@ -47,10 +46,21 @@ class InnvestigateModel(torch.nn.Module):
         self.prediction = None
         self.r_values_per_layer = None
         self.only_max_score = None
+
+        self.p = lrp_exponent
+        self.beta = beta
+        self.eps = epsilon
+        self.module_list = []
+        if method not in AVAILABLE_METHODS:
+            raise NotImplementedError("Only methods available are: " +
+                                      str(AVAILABLE_METHODS))
+        self.method = method
+        self.ignore_unsupported_layers = ignore_unsupported_layers
+
         # Initialize the 'Relevance Propagator' with the chosen rule.
         # This will be used to back-propagate the relevance values
         # through the layers in the innvestigate method.
-        self.inverter = RelevancePropagator(lrp_exponent=lrp_exponent,
+        self.inverter = relevance_propagator(lrp_exponent=lrp_exponent,
                                             beta=beta, method=method, epsilon=epsilon,
                                             device=self.device)
 
@@ -139,7 +149,7 @@ class InnvestigateModel(torch.nn.Module):
 
     def get_r_values_per_layer(self):
         if self.r_values_per_layer is None:
-            pprint("No relevances have been calculated yet, returning None in"
+            print("No relevances have been calculated yet, returning None in"
                    " get_r_values_per_layer.")
         return self.r_values_per_layer
 
@@ -232,3 +242,74 @@ class InnvestigateModel(torch.nn.Module):
         strings are acceptable.
         """
         return self.model.extra_repr()
+
+    def reset_module_list(self):
+        """
+        The module list is reset for every evaluation, in change the order or number
+        of layers changes dynamically.
+
+        Returns:
+            None
+
+        """
+        self.module_list = []
+        # Try to free memory
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    def __get_lrp_layer(self, layer):
+        if isinstance(layer, ALLOWED_PASS_LAYERS):
+            return LRPPassLayer
+
+        try:
+            #Class is key
+            return ALLOWED_LAYERS_BY_NAME[layer.__class__]
+        except KeyError:
+            try:
+                #Full name of class in allowed layers => manually mapped
+                return ALLOWED_LAYERS_BY_NAME[layer.__class__.__name__]
+            except KeyError:
+                try:
+                    #Check if the last parts of name match
+                    name = layer.__class__.__name__.rsplit(".", 1)[-1]
+                    return ALLOWED_LAYERS_BY_NAME[name]
+                except KeyError:
+                    if self.ignore_unsupported_layers:
+                        return LRPPassLayer
+                    else:
+                        raise NotImplementedError("The network contains layers that"
+                                                  " are currently not supported {0:s}".format(str(layer)))
+
+    def compute_propagated_relevance(self, layer, relevance):
+        """
+        This method computes the backward pass for the incoming relevance
+        for the specified layer.
+
+        Args:
+            layer: Layer to be reverted.
+            relevance: Incoming relevance from higher up in the network.
+
+        Returns:
+            The
+
+        """
+        lrp_layer = self.__get_lrp_layer(layer)(self, self.method)
+        return lrp_layer.relprop(layer, relevance)
+
+    def get_layer_fwd_hook(self, layer):
+        """
+        Each layer might need to save very specific data during the forward
+        pass in order to allow for relevance propagation in the backward
+        pass. For example, for max_pooling, we need to store the
+        indices of the max values. In convolutional layers, we need to calculate
+        the normalizations, to ensure the overall amount of relevance is conserved.
+
+        Args:
+            layer: Layer instance for which forward hook is needed.
+
+        Returns:
+            Layer-specific forward hook.
+
+        """
+        lrp_layer = self.__get_lrp_layer(layer)(self, self.method)
+        return lrp_layer.forward

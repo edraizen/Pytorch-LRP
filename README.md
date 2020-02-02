@@ -18,13 +18,40 @@ You can use the visualization methods in this repository on your own model (PyTo
                                   method="e-rule",
                                   beta=.5)
     model_prediction, heatmap = inn_model.innvestigate(in_tensor=data)
-    
+
 `heatmap` contains the relevance heatmap. The methods should work for 2D and 3D images alike, see the MNIST example notebook or the LRP and GB evaluation notebook for an example with MRI images.
-    
+
 
 ## Code Structure
 
-The repository consists of the general LRP wrapper (innvestigator.py and inverter_util.py), a simple example for applying the wrapper in the case of MNIST data, and the evaluation notebook for obtaining the heatmap results discussed in the article. 
+The repository consists of the general LRP wrapper (innvestigator.py), a LRP modules file to explain how to create new modules, a simple example for applying the wrapper in the case of MNIST data, and the evaluation notebook for obtaining the heatmap results discussed in the article.
+
+## Extending to include new LRP modules
+
+To create a new LRP module, subclass the LRPLayer class, and ovveride the forward method to capture the forward hooks and relprop to perform relevance propagtion:
+
+```python
+from torch import nn
+from pytorch_lrp.modules import LRPLayer
+class LSTM(LRPLayer, layer_class=nn.LSTM):
+    def forward(self, m, in_tensor: torch.Tensor,
+      out_tensor: torch.Tensor):
+        #Register forward hooks
+        return super().forward(m, in_tensor, out_tensor)
+
+    def relprop(self, m, relevance_in):
+        #Perform relevance propagation
+        return relevance_in
+```
+
+To add new allowable skip layers, subclass LRPPassLayer and add classes to the ALLOWED_PASS_LAYERS property:
+
+```python
+from torch import nn
+from pytorch_lrp.modules import LRPPassLayer
+class _(LRPPassLayer):
+    ALLOWED_PASS_LAYERS = [nn.Dropout]
+```
 
 ## Heatmaps
 
@@ -38,14 +65,14 @@ The MRI scans used for training are from the [Alzheimer Disease Neuroimaging Ini
 
 ## Requirements
 
-In order to run the code, standard pytorch packages and Python 3 are needed. 
+In order to run the code, standard pytorch packages and Python 3 are needed.
 Moreover, add a settings.py file to the repo, containing the data paths and so forth as follows:
 
 ```
 Please use the example settings.py with more information.
 
 settings = {
-    "model_path": INSERT, 
+    "model_path": INSERT,
     "data_path": INSERT,
     "ADNI_DIR": INSERT,
     "train_h5": INSERT,
@@ -68,5 +95,3 @@ The notebooks "Plotting result graphs" and "Plotting brain maps" can be used to 
 ## Citation
 
 If you use our code, please cite us. The code is published under the BSD License 2.0.
-
-  
