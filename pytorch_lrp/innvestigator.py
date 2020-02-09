@@ -1,10 +1,10 @@
+import time
 import torch
 import numpy as np
 
-from .modules import ALLOWED_LAYERS, ALLOWED_LAYERS_BY_NAME, ALLOWED_PASS_LAYERS, \
-    AVAILABLE_METHODS, LRPPassLayer, Flatten
+from .modules import LRPLayer
 
-class InnvestigateModel(torch.nn.Module):
+class InnvestigateModel(object): #torch.nn.Module):
     """
     ATTENTION:
         Currently, innvestigating a network only works if all
@@ -14,7 +14,7 @@ class InnvestigateModel(torch.nn.Module):
     """
 
     def __init__(self, the_model, lrp_exponent=1, beta=.5, epsilon=1e-6,
-                 method="e-rule", ignore_unsupported_layers=False):
+                 method="e-rule", prediction=None, ignore_unsupported_layers=False):
         """
         Model wrapper for pytorch models to 'innvestigate' them
         with layer-wise relevance propagation (LRP) as introduced by Bach et. al
@@ -40,32 +40,34 @@ class InnvestigateModel(torch.nn.Module):
                     the e-rule treats them equally. For more information,
                     see the paper linked above.
         """
-        super(InnvestigateModel, self).__init__()
+        print("make nn")
+        # super(InnvestigateModel, self).__init__()
+        # print("made nn")
         self.model = the_model
-        self.device = torch.device("cpu", 0)
-        self.prediction = None
+        self.prediction = prediction
         self.r_values_per_layer = None
         self.only_max_score = None
 
-        self.p = lrp_exponent
+
         self.beta = beta
         self.eps = epsilon
-        self.module_list = []
-        if method not in AVAILABLE_METHODS:
-            raise NotImplementedError("Only methods available are: " +
-                                      str(AVAILABLE_METHODS))
-        self.method = method
-        self.ignore_unsupported_layers = ignore_unsupported_layers
 
-        # Initialize the 'Relevance Propagator' with the chosen rule.
-        # This will be used to back-propagate the relevance values
-        # through the layers in the innvestigate method.
-        self.inverter = relevance_propagator(lrp_exponent=lrp_exponent,
-                                            beta=beta, method=method, epsilon=epsilon,
-                                            device=self.device)
+        if method not in LRPLayer.AVAILABLE_METHODS:
+            raise NotImplementedError("Only methods available are: " +
+                                      str(LRPLayer.AVAILABLE_METHODS))
+        self.method = method
+        self.p = lrp_exponent
+        self.eps = epsilon
+        self.ignore_unsupported_layers = ignore_unsupported_layers
+        LRPLayer.CURRENT_METHOD = self.method
+        LRPLayer.LRP_EXPONENT = self.p
+        LRPLayer.EPS = self.eps
+        LRPLayer.ignore_unsupported_layers = self.ignore_unsupported_layers
 
         # Parsing the individual model layers
+        print("start hooks")
         self.register_hooks(self.model)
+        print("done hooks")
         if method == "b-rule" and float(beta) in (-1., 0):
             which = "positive" if beta == -1 else "negative"
             which_opp = "negative" if beta == -1 else "positive"
@@ -75,16 +77,6 @@ class InnvestigateModel(torch.nn.Module):
                   "if in any layer only " + which_opp +
                   " contributions exist, the "
                   "overall relevance will not be conserved.\n")
-
-    def cuda(self, device=None):
-        self.device = torch.device("cuda", device)
-        self.inverter.device = self.device
-        return super(InnvestigateModel, self).cuda(device)
-
-    def cpu(self):
-        self.device = torch.device("cpu", 0)
-        self.inverter.device = self.device
-        return super(InnvestigateModel, self).cpu()
 
     def register_hooks(self, parent_module):
         """
@@ -102,19 +94,10 @@ class InnvestigateModel(torch.nn.Module):
             if list(mod.children()):
                 self.register_hooks(mod)
                 continue
-            mod.register_forward_hook(
-                self.inverter.get_layer_fwd_hook(mod))
-            if isinstance(mod, torch.nn.ReLU):
-                mod.register_backward_hook(
-                    self.relu_hook_function
-                )
-
-    @staticmethod
-    def relu_hook_function(module, grad_in, grad_out):
-        """
-        If there is a negative gradient, change it to zero.
-        """
-        return (torch.clamp(grad_in[0], min=0.0),)
+            lrp_layer = LRPLayer.get(mod)
+            mod.register_forward_hook(lrp_layer.forward)
+            if hasattr(lrp_layer, "backward"):
+                mod.register_backward_hook(lrp_layer.backward)
 
     def __call__(self, in_tensor):
         """
@@ -141,17 +124,28 @@ class InnvestigateModel(torch.nn.Module):
         Returns:
             Model prediction
         """
-        # Reset module list. In case the structure changes dynamically,
-        # the module list is tracked for every forward pass.
-        self.inverter.reset_module_list()
         self.prediction = self.model(in_tensor)
         return self.prediction
 
-    def get_r_values_per_layer(self):
-        if self.r_values_per_layer is None:
+    def get_r_values_per_layer(self, parent_module=None):
+        if parent_module is None:
+            parent_module = self.model
+
+        r_values = []
+        for mod in parent_module.children():
+            if list(mod.children()):
+                r_values += self.get_r_values_per_layer(mod)
+                continue
+            if not hasattr(mod, "relevance"):
+                return []
+            r_values.append(mod.relevance)
+
+        if parent_module is None and len(r_values) == 0:
             print("No relevances have been calculated yet, returning None in"
                    " get_r_values_per_layer.")
-        return self.r_values_per_layer
+            return None
+
+        return r_values
 
     def innvestigate(self, in_tensor=None, rel_for_class=None):
         """
@@ -171,10 +165,8 @@ class InnvestigateModel(torch.nn.Module):
             In order to get relevance distributions in other layers, use
             the get_r_values_per_layer method.
         """
-        if self.r_values_per_layer is not None:
-            for elt in self.r_values_per_layer:
-                del elt
-            self.r_values_per_layer = None
+        print("run")
+
 
         with torch.no_grad():
             # Check if innvestigation can be performed.
@@ -187,7 +179,9 @@ class InnvestigateModel(torch.nn.Module):
 
             # Evaluate the model anew if a new input is supplied.
             if in_tensor is not None:
+                print("start evaluate")
                 self.evaluate(in_tensor)
+                print("end evaluate")
 
             # If no class index is specified, analyze for class
             # with highest prediction.
@@ -198,38 +192,34 @@ class InnvestigateModel(torch.nn.Module):
                 # Make sure shape is just a 1D vector per batch example.
                 self.prediction = self.prediction.view(org_shape[0], -1)
                 max_v, _ = torch.max(self.prediction, dim=1, keepdim=True)
-                only_max_score = torch.zeros_like(self.prediction).to(self.device)
+                only_max_score = torch.zeros_like(self.prediction)
                 only_max_score[max_v == self.prediction] = self.prediction[max_v == self.prediction]
-                relevance_tensor = only_max_score.view(org_shape)
+                relevance = only_max_score.view(org_shape)
                 self.prediction.view(org_shape)
 
             else:
                 org_shape = self.prediction.size()
                 self.prediction = self.prediction.view(org_shape[0], -1)
-                only_max_score = torch.zeros_like(self.prediction).to(self.device)
+                only_max_score = torch.zeros_like(self.prediction)
                 only_max_score[:, rel_for_class] += self.prediction[:, rel_for_class]
-                relevance_tensor = only_max_score.view(org_shape)
+                relevance = only_max_score.view(org_shape)
                 self.prediction.view(org_shape)
 
-            # We have to iterate through the model backwards.
-            # The module list is computed for every forward pass
-            # by the model inverter.
-            rev_model = self.inverter.module_list[::-1]
-            relevance = relevance_tensor.detach()
-            del relevance_tensor
-            # List to save relevance distributions per layer
-            r_values_per_layer = [relevance]
-            for layer in rev_model:
-                # Compute layer specific backwards-propagation of relevance values
-                relevance = self.inverter.compute_propagated_relevance(layer, relevance)
-                r_values_per_layer.append(relevance.cpu())
+            print(relevance)
 
-            self.r_values_per_layer = r_values_per_layer
+            relevance_out = LRPLayer.get(self.model).relprop_(self.model, relevance)
 
-            del relevance
-            if self.device.type == "cuda":
-                torch.cuda.empty_cache()
-            return self.prediction, r_values_per_layer[-1]
+            if False:
+                # List to save relevance distributions per layer
+                r_values_per_layer = [relevance]
+                for layer in rev_model:
+                    # Compute layer specific backwards-propagation of relevance values
+                    relevance = self.compute_propagated_relevance(layer, relevance)
+                    r_values_per_layer.append(relevance.cpu())
+
+                self.r_values_per_layer = r_values_per_layer
+
+            return self.prediction, relevance_out
 
     def forward(self, in_tensor):
         return self.model.forward(in_tensor)
@@ -242,74 +232,3 @@ class InnvestigateModel(torch.nn.Module):
         strings are acceptable.
         """
         return self.model.extra_repr()
-
-    def reset_module_list(self):
-        """
-        The module list is reset for every evaluation, in change the order or number
-        of layers changes dynamically.
-
-        Returns:
-            None
-
-        """
-        self.module_list = []
-        # Try to free memory
-        if self.device.type == "cuda":
-            torch.cuda.empty_cache()
-
-    def __get_lrp_layer(self, layer):
-        if isinstance(layer, ALLOWED_PASS_LAYERS):
-            return LRPPassLayer
-
-        try:
-            #Class is key
-            return ALLOWED_LAYERS_BY_NAME[layer.__class__]
-        except KeyError:
-            try:
-                #Full name of class in allowed layers => manually mapped
-                return ALLOWED_LAYERS_BY_NAME[layer.__class__.__name__]
-            except KeyError:
-                try:
-                    #Check if the last parts of name match
-                    name = layer.__class__.__name__.rsplit(".", 1)[-1]
-                    return ALLOWED_LAYERS_BY_NAME[name]
-                except KeyError:
-                    if self.ignore_unsupported_layers:
-                        return LRPPassLayer
-                    else:
-                        raise NotImplementedError("The network contains layers that"
-                                                  " are currently not supported {0:s}".format(str(layer)))
-
-    def compute_propagated_relevance(self, layer, relevance):
-        """
-        This method computes the backward pass for the incoming relevance
-        for the specified layer.
-
-        Args:
-            layer: Layer to be reverted.
-            relevance: Incoming relevance from higher up in the network.
-
-        Returns:
-            The
-
-        """
-        lrp_layer = self.__get_lrp_layer(layer)(self, self.method)
-        return lrp_layer.relprop(layer, relevance)
-
-    def get_layer_fwd_hook(self, layer):
-        """
-        Each layer might need to save very specific data during the forward
-        pass in order to allow for relevance propagation in the backward
-        pass. For example, for max_pooling, we need to store the
-        indices of the max values. In convolutional layers, we need to calculate
-        the normalizations, to ensure the overall amount of relevance is conserved.
-
-        Args:
-            layer: Layer instance for which forward hook is needed.
-
-        Returns:
-            Layer-specific forward hook.
-
-        """
-        lrp_layer = self.__get_lrp_layer(layer)(self, self.method)
-        return lrp_layer.forward
