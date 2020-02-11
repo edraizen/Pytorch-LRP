@@ -2,9 +2,9 @@ import time
 import torch
 import numpy as np
 
-from .modules import LRPLayer
+from .modules import LRPLayer, LRPPassLayer, AVAILABLE_METHODS
 
-class InnvestigateModel(object): #torch.nn.Module):
+class InnvestigateModel(object):
     """
     ATTENTION:
         Currently, innvestigating a network only works if all
@@ -40,9 +40,7 @@ class InnvestigateModel(object): #torch.nn.Module):
                     the e-rule treats them equally. For more information,
                     see the paper linked above.
         """
-        print("make nn")
         # super(InnvestigateModel, self).__init__()
-        # print("made nn")
         self.model = the_model
         self.prediction = prediction
         self.r_values_per_layer = None
@@ -52,9 +50,9 @@ class InnvestigateModel(object): #torch.nn.Module):
         self.beta = beta
         self.eps = epsilon
 
-        if method not in LRPLayer.AVAILABLE_METHODS:
+        if method not in AVAILABLE_METHODS:
             raise NotImplementedError("Only methods available are: " +
-                                      str(LRPLayer.AVAILABLE_METHODS))
+                                      str(AVAILABLE_METHODS))
         self.method = method
         self.p = lrp_exponent
         self.eps = epsilon
@@ -65,9 +63,11 @@ class InnvestigateModel(object): #torch.nn.Module):
         LRPLayer.ignore_unsupported_layers = self.ignore_unsupported_layers
 
         # Parsing the individual model layers
-        print("start hooks")
-        self.register_hooks(self.model)
-        print("done hooks")
+        setattr(self.model, "LAYER_NUM", 0)
+        nlayers = self.register_hooks(self.model)
+        LRPLayer.N_LAYERS = nlayers
+
+
         if method == "b-rule" and float(beta) in (-1., 0):
             which = "positive" if beta == -1 else "negative"
             which_opp = "negative" if beta == -1 else "positive"
@@ -78,7 +78,7 @@ class InnvestigateModel(object): #torch.nn.Module):
                   " contributions exist, the "
                   "overall relevance will not be conserved.\n")
 
-    def register_hooks(self, parent_module):
+    def register_hooks(self, parent_module, start_index=1, it=0):
         """
         Recursively unrolls a model and registers the required
         hooks to save all the necessary values for LRP in the forward pass.
@@ -90,14 +90,20 @@ class InnvestigateModel(object): #torch.nn.Module):
             None
 
         """
-        for mod in parent_module.children():
+        # print(str(parent_module).split("\n")[0], "Layer num", start_index)
+        # setattr(parent_module, "LAYER_NUM", start_index)
+        for i, mod in enumerate(parent_module.children()):
+            setattr(mod, "LAYER_NUM", start_index+i)
             if list(mod.children()):
-                self.register_hooks(mod)
-                continue
-            lrp_layer = LRPLayer.get(mod)
-            mod.register_forward_hook(lrp_layer.forward)
-            if hasattr(lrp_layer, "backward"):
-                mod.register_backward_hook(lrp_layer.backward)
+                start_index = self.register_hooks(mod, start_index=start_index+i+1)
+            else:
+                lrp_layer = LRPLayer.get(mod)
+                if not isinstance(lrp_layer, LRPPassLayer):
+                    mod.register_forward_hook(lrp_layer.forward)
+                    if hasattr(lrp_layer, "backward"):
+                        mod.register_backward_hook(lrp_layer.backward)
+
+        return start_index+i+2 if i>0 else start_index+1
 
     def __call__(self, in_tensor):
         """
@@ -165,9 +171,6 @@ class InnvestigateModel(object): #torch.nn.Module):
             In order to get relevance distributions in other layers, use
             the get_r_values_per_layer method.
         """
-        print("run")
-
-
         with torch.no_grad():
             # Check if innvestigation can be performed.
             if in_tensor is None and self.prediction is None:
@@ -179,9 +182,7 @@ class InnvestigateModel(object): #torch.nn.Module):
 
             # Evaluate the model anew if a new input is supplied.
             if in_tensor is not None:
-                print("start evaluate")
                 self.evaluate(in_tensor)
-                print("end evaluate")
 
             # If no class index is specified, analyze for class
             # with highest prediction.
@@ -207,7 +208,12 @@ class InnvestigateModel(object): #torch.nn.Module):
 
             print(relevance)
 
-            relevance_out = LRPLayer.get(self.model).relprop_(self.model, relevance)
+            lrp_module = LRPLayer.get(self.model)
+            lrp_module.NORMALIZE_BEFORE = True
+            lrp_module.NORMALIZE_AFTER = True
+            relevance_out = lrp_module.relprop_(self.model, relevance)
+
+            print("RELEVANCE =", relevance_out)
 
             if False:
                 # List to save relevance distributions per layer

@@ -1,46 +1,73 @@
+import os
 import torch
 import time
 import numpy as np
 import torch.nn.functional as F
+import psutil
 
-class Flatten(torch.nn.Module):
-    def __init__(self):
-        super(Flatten, self).__init__()
+from .rules import e_rule, g_rule, zero_rule, z_beta_rule
 
-    def forward(self, in_tensor):
-        return in_tensor.view((in_tensor.size()[0], -1))
+AVAILABLE_METHODS = []
+ALLOWED_LAYERS = []
+ALLOWED_LAYERS_BY_NAME = {}
+AVAILABLE_METHODS = set()
+
+ALLOWED_PASS_LAYERS = [
+    torch.nn.BatchNorm1d, torch.nn.BatchNorm2d, torch.nn.BatchNorm3d,
+    torch.nn.ELU, torch.nn.Dropout, torch.nn.Dropout2d, torch.nn.Dropout3d,
+    torch.nn.Softmax, torch.nn.Sigmoid]
+
+def sizeof_fmt(num, suffix='B'):
+    for unit in ['','Ki','Mi','Gi','Ti','Pi','Ei','Zi']:
+        if abs(num) < 1024.0:
+            return "%3.1f%s%s" % (num, unit, suffix)
+        num /= 1024.0
+    return "%.1f%s%s" % (num, 'Yi', suffix)
 
 class LRPLayer(object):
+    #Layer specific, subclasses can change these
     CURRENT_METHOD = None
+    NORMALIZE_BEFORE = False #True
+    NORMALIZE_AFTER = False #True
+
+    LAYER_NUM = None
+    N_LAYERS = None
+
+    #Normalization parameters
+    NORMALIZE_METHOD = "fraction_clamp_filter"
+    FRACTION_PASS_FILTER = [[0.0,0.6], [-0.6,-0.0]] #Postive, negetive
+    FRACTION_CLAMP_FILTER = [[0.0,0.6], [-0.6,-0.0]] #Postive, negetive
+
     LRP_EXPONENT = 1.
     EPS = 1e-6
-    ignore_unsupported_layers = False
-    AVAILABLE_METHODS = []
-    ALLOWED_LAYERS = []
-    ALLOWED_LAYERS_BY_NAME = {}
-    AVAILABLE_METHODS = set()
-    ALLOWED_PASS_LAYERS = [
-        torch.nn.BatchNorm1d, torch.nn.BatchNorm2d, torch.nn.BatchNorm3d,
-        torch.nn.ELU, Flatten,
-        torch.nn.Dropout, torch.nn.Dropout2d, torch.nn.Dropout3d,
-        torch.nn.Softmax, torch.nn.LogSoftmax, torch.nn.Sigmoid]
+    IGNORE_UNSUPPORTED_LAYERS = False
+    EPSILON = 0.25
+    GAMMA = 0.25
 
     @classmethod
     def __init_subclass__(cls, layer_class=None, **kwds):
         super().__init_subclass__(*kwds)
-        LRPLayer.ALLOWED_LAYERS.append(cls)
-        if layer_class is None:
-            layer_class = cls.__name__.rsplit(".", 1)[-1]
-        LRPLayer.ALLOWED_LAYERS_BY_NAME[layer_class] = cls
-        LRPLayer.AVAILABLE_METHODS |= set(cls.AVAILABLE_METHODS)
+        global ALLOWED_LAYERS
+        global ALLOWED_LAYERS_BY_NAME
+        global AVAILABLE_METHODS
+
+        ALLOWED_LAYERS.append(cls)
+        layer_name = cls.__name__ if layer_class is None else layer_class.__name__
+        ALLOWED_LAYERS_BY_NAME[layer_name] = cls
+
+        if hasattr(cls, "AVAILABLE_METHODS") and isinstance(
+          cls.AVAILABLE_METHODS, (list, tuple)):
+            AVAILABLE_METHODS |= set(cls.AVAILABLE_METHODS)
 
         #If its an LRPPassLayer, it might have allowed pass modules
         if hasattr(cls, "ALLOWED_PASS_LAYERS") and isinstance(
           cls.ALLOWED_PASS_LAYERS, (list, tuple)):
-            LRPLayer.ALLOWED_PASS_LAYERS += cls.ALLOWED_PASS_LAYERS
+            global ALLOWED_PASS_LAYERS
+            ALLOWED_PASS_LAYERS += cls.ALLOWED_PASS_LAYERS
 
     def forward_(self, m, in_tensor: torch.Tensor,
       out_tensor: torch.Tensor):
+        """Call the forward method and time it"""
         start = time.time()
         self.forward(m, in_tensor, out_tensor)
         end = time.time()
@@ -51,37 +78,88 @@ class LRPLayer(object):
         return None
 
     def relprop_(self, m, relevance_in):
+        if hasattr(m, "LAYER_NUM"):
+            layer_level = 1-(m.LAYER_NUM/LRPLayer.N_LAYERS)
+            if layer_level < 0.2:
+                #Upper layers
+                self.CURRENT_METHOD = "0-rule"
+            elif 0.2<=layer_level<0.5:
+                #Middle layers
+                self.CURRENT_METHOD = "e-rule"
+            else:
+                #Lower layers
+                self.CURRENT_METHOD = "g-rule"
+
+        if self.NORMALIZE_BEFORE:
+            self.relnormalize(relevance_in)
         relevance = self.relprop(m, relevance_in)
+        if self.NORMALIZE_AFTER:
+            if getattr(self, "done", False):
+                print("relnormalize at end")
+            self.relnormalize(relevance)
         setattr(m, "relevance", relevance)
         return relevance
 
     def relprop(self, m, relevance_in):
         return relevance_in.detach()
 
+    def relnormalize(self, relevance):
+        """Modified from github repo etjoa003/medical_imaging:
+        https://github.com/etjoa003/medical_imaging/blob/master/isles2017/models/networks.py"""
+        if isinstance(relevance, (list, tuple)):
+            return [self.relnormalize(r) for r in relevance]
+
+        if self.NORMALIZE_METHOD in [None, 'raw']:
+            return relevance
+        elif self.NORMALIZE_METHOD == 'standard':
+            # this is bad. the sum can go too large
+            ss = torch.sum(R**2)**0.5
+            return relevance/ss
+        elif self.NORMALIZE_METHOD == 'fraction_pass_filter':
+            ss = torch.max(torch.FloatTensor.abs(relevance))
+            relevance = relevance/ss
+            ppf = self.FRACTION_PASS_FILTER[0]
+            npf = self.FRACTION_PASS_FILTER[1]
+            Rplus = relevance*(relevance>=ppf[0]).to(torch.float)*(relevance<=ppf[1]).to(torch.float)
+            Rmin = relevance*(relevance>=npf[0]).to(torch.float)*(relevance<=npf[1]).to(torch.float)
+            return ss*(Rmin+Rplus)
+        elif self.NORMALIZE_METHOD == 'fraction_clamp_filter':
+            ss = torch.max(torch.FloatTensor.abs(relevance))
+            relevance = relevance/ss
+            ppf = self.FRACTION_CLAMP_FILTER[0]
+            npf = self.FRACTION_CLAMP_FILTER[1]
+            Rplus = torch.clamp(relevance,min=ppf[0], max=ppf[1])*(relevance>=0).to(torch.float)
+            Rmin = 	torch.clamp(relevance,min=npf[0], max=npf[1])*(relevance<0).to(torch.float)
+            #print(self.__class__.__name__, "R", Rmin+Rplus)
+            #print(self.__class__.__name__, "ss", ss)
+            return ss*(Rmin+Rplus)
+        else:
+            raise Exception('Invalid normalization method {}'.format(self.NORMALIZE_METHOD))
+
     @staticmethod
     def get(layer):
         try:
             #Class is key
-            return LRPLayer.ALLOWED_LAYERS_BY_NAME[layer.__class__]()
+            return ALLOWED_LAYERS_BY_NAME[layer.__class__]()
         except KeyError:
             try:
                 #Full name of class in allowed layers => manually mapped
-                return LRPLayer.ALLOWED_LAYERS_BY_NAME[layer.__class__.__name__]()
+                return ALLOWED_LAYERS_BY_NAME[layer.__class__.__name__]()
             except KeyError:
                 try:
                     #Check if the last parts of name match
                     name = layer.__class__.__name__.rsplit(".", 1)[-1]
-                    return LRPLayer.ALLOWED_LAYERS_BY_NAME[name]()
+                    return ALLOWED_LAYERS_BY_NAME[name]()
                 except KeyError:
-                    if hasattr(layer, "children"):
+                    if layer.__class__ in ALLOWED_PASS_LAYERS:
+                        return LRPPassLayer()
+                    if hasattr(layer, "children") and list(layer.children()):
                         #Starting module, run through all children
                         return Module()
-                    elif hasattr(layer, "_modules"):
+                    elif hasattr(layer, "_modules") and list(layer._modules):
                         #Unknown module but has sub modules
                         return Container()
-                    elif layer.__class__ in LRPLayer.ALLOWED_PASS_LAYERS or \
-                      not LRPLayer.ignore_unsupported_layers:
-                        print("Unknown layer", layer)
+                    elif not LRPLayer.ignore_unsupported_layers:
                         return LRPPassLayer()
                     else:
                         raise NotImplementedError("The network contains layers that"
@@ -93,17 +171,15 @@ class LRPPassLayer(LRPLayer):
 
 class Module(LRPLayer, layer_class=torch.nn.Module):
     def relprop(self, module, relevance_in):
+        print("Running", str(module).split("\n")[0])
         for m in reversed(list(module.children())):
-            print("Module running layer", m)
             relevance_in = LRPLayer.get(m).relprop_(m, relevance_in).detach()
-            print("    relevence =", relevance_in)
         return relevance_in.detach()
 
 class Container(LRPLayer, layer_class=torch.nn.Container):
     def relprop(self, module, relevance_in):
         with torch.no_grad():
             for m in reversed(module._modules.values()):
-                print("Container running layer", m)
                 relevance_in = LRPLayer.get(m).relprop_(m, relevance_in)
             return relevance_in
 
@@ -142,6 +218,7 @@ class ReLU(LRPLayer, layer_class=torch.nn.ReLU):
 
 class Linear(LRPLayer, layer_class=torch.nn.Linear):
     AVAILABLE_METHODS = ["e-rule", "b-rule"]
+    #NORMALIZE_AFTER = True
 
     def forward(self, m, in_tensor: torch.Tensor,
       out_tensor: torch.Tensor):
@@ -150,19 +227,29 @@ class Linear(LRPLayer, layer_class=torch.nn.Linear):
         return super().forward(m, in_tensor, out_tensor)
 
     def relprop(self, m, relevance_in):
-        if LRPLayer.CURRENT_METHOD == "e-rule":
+        if LRPLayer.CURRENT_METHOD in ["e-rule", "0-rule", "g-rule"]:
             with torch.no_grad():
-                m.in_tensor = m.in_tensor.pow(LRPLayer.LRP_EXPONENT)
-                w = m.weight.pow(LRPLayer.LRP_EXPONENT)
-                norm = F.linear(m.in_tensor, w, bias=None)
+                if LRPLayer.LRP_EXPONENT != 1:
+                    m.in_tensor = m.in_tensor.pow(LRPLayer.LRP_EXPONENT)
+                    weight = m.weight.pow(LRPLayer.LRP_EXPONENT)
+                else:
+                    weight = m.weight
 
-                norm = norm + torch.sign(norm) * LRPLayer.EPS
-                relevance_in[norm == 0] = 0
-                norm[norm == 0] = 1
-                relevance_out = F.linear(relevance_in / norm,
-                                         w.t(), bias=None)
-                relevance_out *= m.in_tensor
-                del m.in_tensor, norm, w, relevance_in
+                if LRPLayer.CURRENT_METHOD == "g-rule":
+                    weight += LRPLayer.GAMMA*F.relu(w)
+
+                Z = F.linear(m.in_tensor, weight, bias=None)
+                Z += torch.sign(Z) * (self.EPSILON if \
+                    LRPLayer.CURRENT_METHOD == "e-rule" else self.EPS)
+
+                S = relevance_in/Z
+
+                # relevance_in[norm == 0] = 0
+                # norm[norm == 0] = 1
+                C = F.linear(S, weight.t(), bias=None)
+                relevance_out = m.in_tensor*C
+
+                del m.in_tensor, m.out_shape, weight, Z, S, C
 
         if LRPLayer.CURRENT_METHOD == "b-rule":
             with torch.no_grad():
@@ -295,13 +382,13 @@ class MaxPool3d(_MaxPoolNd, layer_class=torch.nn.MaxPool1d):
     invert_pool = F.max_unpool3d
 
 class _ConvNd(LRPLayer):
-    AVAILABLE_METHODS = ["e-rule", "b-rule"]
+    AVAILABLE_METHODS = ["e-rule", "b-rule", "0-rule"]
 
     def forward(self, m, in_tensor: torch.Tensor,
                          out_tensor: torch.Tensor):
         setattr(m, "in_tensor", in_tensor[0])
         setattr(m, 'out_shape', list(out_tensor.size()))
-        setattr(m, 'out_tensor', out_tensor.features.copy())
+        setattr(m, 'out_tensor', out_tensor.features)
         return super().forward(m, in_tensor, out_tensor)
 
     def relprop(self, m, relevance_in):
@@ -310,29 +397,47 @@ class _ConvNd(LRPLayer):
         # make sure the relevance is put into the same shape as before.
         #relevance_in = self.reshape(m, relevance_in)
 
-        if LRPLayer.CURRENT_METHOD == "e-rule":
+        if LRPLayer.CURRENT_METHOD in ["e-rule", "0-rule", "g-rule"]:
             with torch.no_grad():
-                m.in_tensor = m.in_tensor.pow(LRPLayer.LRP_EXPONENT).detach()
-                w = m.weight.pow(LRPLayer.LRP_EXPONENT).detach()
-                norm = self.conv_nd(
+                if LRPLayer.LRP_EXPONENT != 1:
+                    m.in_tensor = m.in_tensor.pow(LRPLayer.LRP_EXPONENT).detach()
+                    w = m.weight.pow(LRPLayer.LRP_EXPONENT).detach()
+                    run_forward = True
+                else:
+                    w = m.weight
+                    run_forward = False
+
+                if LRPLayer.CURRENT_METHOD == "g-rule":
+                    w += LRPLayer.GAMMA*F.relu(w)
+                    run_forward = True
+
+                if run_forward:
+                    Z = self.conv_nd(
+                        m,
+                        m.in_tensor,
+                        w,
+                        bias=None)
+                    #norm = norm + torch.sign(norm) * LRPLayer.EPS
+                else:
+                    Z = m.out_tensor
+
+                Z, relevance_in = self.reshape(Z, relevance_in)
+
+                Z += self.EPSILON if LRPLayer.CURRENT_METHOD == "e-rule" else self.EPS
+
+
+                S = relevance_in/Z
+                #relevance_in[norm == 0] = 0
+                #norm[norm == 0] = 1
+                C = self.inv_conv_nd(
                     m,
-                    m.in_tensor,
+                    S,
                     w,
                     bias=None)
-                norm = norm + torch.sign(norm) * LRPLayer.EPS
 
-                norm, relevance_in = self.reshape(norm, relevance_in)
+                relevance_out = m.in_tensor*C
+                del m.in_tensor, Z, S, w, relevance_in
 
-                relevance_in[norm == 0] = 0
-                norm[norm == 0] = 1
-                x = relevance_in/norm
-                relevance_out = self.inv_conv_nd(
-                    m,
-                    relevance_in/norm,
-                    w,
-                    bias=None)
-                relevance_out *= m.in_tensor
-                del m.in_tensor, norm, w
 
         elif LRPLayer.CURRENT_METHOD == "b-rule":
             with torch.no_grad():
@@ -446,7 +551,6 @@ class _ConvNd(LRPLayer):
         return
 
     def reshape(self, in_tensor, relevance_in):
-        print("resize", m, m.out_shape, relevance_in.size())
         return in_tensor.size(), relevance_in.view(in_tensor.size())
 
     def conv_nd(self, layer, in_tensor, weight, bias=None, scale_groups=1):
