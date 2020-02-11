@@ -4,6 +4,8 @@ from sklearn.model_selection import train_test_split
 import jrieke.datasets as datasets
 import numpy as np
 
+from pytorch_lrp.modules import LRPPassLayer
+
 
 def pprint(*args):
     out = [str(argument) + "\n" for argument in args]
@@ -17,6 +19,8 @@ class Flatten(torch.nn.Module):
     def forward(self, in_tensor):
         return in_tensor.view((in_tensor.size()[0], -1))
 
+class _Flatten(LRPPassLayer, layer_class=Flatten)
+    pass
 
 def load_data():
 
@@ -61,4 +65,3 @@ def scale_mask(mask, shape):
         nmm_map[pad_left[0]:-pad_right[0], pad_left[1]:-pad_right[1], pad_left[2]:-pad_right[2]] += zoomed_lbl * lbl_idx
 
     return nmm_map
-
