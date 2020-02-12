@@ -2,7 +2,7 @@ import time
 import torch
 import numpy as np
 
-from .modules import LRPLayer, LRPPassLayer, AVAILABLE_METHODS
+from .modules import LRPLayer, LRPPassLayer, cpu_usage, gpu_usage
 
 class InnvestigateModel(object):
     """
@@ -14,7 +14,7 @@ class InnvestigateModel(object):
     """
 
     def __init__(self, the_model, lrp_exponent=1, beta=.5, epsilon=1e-6,
-                 method="e-rule", prediction=None, ignore_unsupported_layers=False):
+                 prediction=None, ignore_unsupported_layers=False):
         """
         Model wrapper for pytorch models to 'innvestigate' them
         with layer-wise relevance propagation (LRP) as introduced by Bach et. al
@@ -49,34 +49,19 @@ class InnvestigateModel(object):
 
         self.beta = beta
         self.eps = epsilon
-
-        if method not in AVAILABLE_METHODS:
-            raise NotImplementedError("Only methods available are: " +
-                                      str(AVAILABLE_METHODS))
-        self.method = method
         self.p = lrp_exponent
-        self.eps = epsilon
         self.ignore_unsupported_layers = ignore_unsupported_layers
-        LRPLayer.CURRENT_METHOD = self.method
+
         LRPLayer.LRP_EXPONENT = self.p
         LRPLayer.EPS = self.eps
+        LRPLayer.BETA = self.beta
         LRPLayer.ignore_unsupported_layers = self.ignore_unsupported_layers
 
         # Parsing the individual model layers
+        print("Start unravel", cpu_usage(), gpu_usage())
         setattr(self.model, "LAYER_NUM", 0)
         nlayers = self.register_hooks(self.model)
         LRPLayer.N_LAYERS = nlayers
-
-
-        if method == "b-rule" and float(beta) in (-1., 0):
-            which = "positive" if beta == -1 else "negative"
-            which_opp = "negative" if beta == -1 else "positive"
-            print("WARNING: With the chosen beta value, "
-                  "only " + which + " contributions "
-                  "will be taken into account.\nHence, "
-                  "if in any layer only " + which_opp +
-                  " contributions exist, the "
-                  "overall relevance will not be conserved.\n")
 
     def register_hooks(self, parent_module, start_index=1, it=0):
         """
@@ -99,9 +84,9 @@ class InnvestigateModel(object):
             else:
                 lrp_layer = LRPLayer.get(mod)
                 if not isinstance(lrp_layer, LRPPassLayer):
-                    mod.register_forward_hook(lrp_layer.forward)
+                    mod.register_forward_hook(lrp_layer.forward_hook)
                     if hasattr(lrp_layer, "backward"):
-                        mod.register_backward_hook(lrp_layer.backward)
+                        mod.register_backward_hook(lrp_layer.backward_hook)
 
         return start_index+i+2 if i>0 else start_index+1
 
@@ -180,6 +165,7 @@ class InnvestigateModel(object):
                                    "or call innvestigate with a new input to "
                                    "evaluate.")
 
+            print("Start InnvestigateModel", cpu_usage(), gpu_usage())
             # Evaluate the model anew if a new input is supplied.
             if in_tensor is not None:
                 self.evaluate(in_tensor)
@@ -196,7 +182,6 @@ class InnvestigateModel(object):
                 only_max_score = torch.zeros_like(self.prediction)
                 only_max_score[max_v == self.prediction] = self.prediction[max_v == self.prediction]
                 relevance = only_max_score.view(org_shape)
-                self.prediction.view(org_shape)
 
             else:
                 org_shape = self.prediction.size()
@@ -204,14 +189,18 @@ class InnvestigateModel(object):
                 only_max_score = torch.zeros_like(self.prediction)
                 only_max_score[:, rel_for_class] += self.prediction[:, rel_for_class]
                 relevance = only_max_score.view(org_shape)
-                self.prediction.view(org_shape)
-
-            print(relevance)
 
             lrp_module = LRPLayer.get(self.model)
             lrp_module.NORMALIZE_BEFORE = True
             lrp_module.NORMALIZE_AFTER = True
+
+            torch.cuda.empty_cache()
+
             relevance_out = lrp_module.relprop_(self.model, relevance)
+
+            torch.cuda.empty_cache()
+
+            del lrp_module
 
             print("RELEVANCE =", relevance_out)
 
