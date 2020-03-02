@@ -37,9 +37,10 @@ class SparseLRPFunctionLayer(LRPFunctionLayer):
         return None
 
     @staticmethod
-    def clean(m):
-        del m.in_shape, m.in_tensor, m.out_tensor, m.out_shape, m.metadata, \
-            m.in_spatial_size, m.out_spatial_size
+    def clean(m, force=False):
+        if force:
+            del m.in_shape, m.in_tensor, m.out_tensor, m.out_shape, m.metadata, \
+                m.in_spatial_size, m.out_spatial_size
 
     @staticmethod
     def reshape(in_tensor, relevance_in):
@@ -57,8 +58,9 @@ class InputLayer(SparseLRPLayer, layer_class=scn.InputLayer):
         setattr(m, 'metadata', out_tensor.metadata)
 
     @staticmethod
-    def clean(m):
-        del m.in_tensor, m.in_shape, m.metadata
+    def clean(m, force=False):
+        if force:
+            del m.in_tensor, m.in_shape, m.metadata
 
     @staticmethod
     def forward_pass(m, in_tensor):
@@ -345,6 +347,11 @@ class JoinTable(SparseLRPLayer, layer_class=scn.JoinTable):
         setattr(m, "types", [t.__class__ for t in in_tensor[0]])
         del sizes
 
+    @staticmethod
+    def clean(m, force=False):
+        if force:
+            del m.in_sizes, m.types
+
     @classmethod
     def relprop(cls, m, relevance_in):
         with torch.no_grad():
@@ -361,13 +368,17 @@ class JoinTable(SparseLRPLayer, layer_class=scn.JoinTable):
             else:
                 print("??JoinTable", len(m.types)==2, m.types[0])
 
-        del m.in_sizes, m.types
         return relevance_out
 
 class AddTable(SparseLRPLayer, layer_class=scn.AddTable):
     @staticmethod
     def forward_hook(m, in_tensor: torch.Tensor, out_tensor: torch.Tensor):
         setattr(m, "n_in_tensors", len(in_tensor[0]))
+
+    @staticmethod
+    def clean(m, force=False):
+        if force:
+            del m.n_in_tensors
 
     @classmethod
     def relprop(cls, m, relevance_in, use_mean=True):
@@ -377,7 +388,6 @@ class AddTable(SparseLRPLayer, layer_class=scn.AddTable):
             relevance_out = [relevance_in.detach()]*m.n_in_tensors
 
             del relevance_in
-            del m.n_in_tensors
         return relevance_out
 
 """

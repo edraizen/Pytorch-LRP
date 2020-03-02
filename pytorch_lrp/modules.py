@@ -84,11 +84,11 @@ class LRPLayer(object):
         return
 
     @staticmethod
-    def clean(m):
+    def clean(m, force=False):
         return
 
     @classmethod
-    def relprop_(cls, m, relevance_in):
+    def relprop_(cls, m, relevance_in, clean=True):
         if cls.NORMALIZE_BEFORE:
             relevance_in = cls.relnormalize(relevance_in)
         name = str(m).split("\n")[0]
@@ -108,7 +108,7 @@ class LRPLayer(object):
         del relevance_in
         #setattr(m, "relevance", relevance)
 
-        cls.clean(m)
+        cls.clean(m, clean)
 
         torch.cuda.empty_cache()
 
@@ -202,13 +202,13 @@ class LRPFunctionLayer(LRPLayer):
     def forward_hook(m, in_tensor: torch.Tensor, out_tensor: torch.Tensor):
         setattr(m, 'in_shape', in_tensor[0].size())
         setattr(m, "in_tensor", in_tensor[0])
-        #setattr(m, 'out_tensor', out_tensor)
         setattr(m, 'out_shape', out_tensor.size())
         return None
 
     @staticmethod
-    def clean(m):
-        del m.in_shape, m.in_tensor, m.out_shape #,m.out_tensor,
+    def clean(m, force=False):
+        if force:
+            del m.in_shape, m.in_tensor, m.out_shape
 
     @staticmethod
     def reshape(a, b):

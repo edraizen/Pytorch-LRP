@@ -10,22 +10,21 @@ class Rule(object):
         RULES[cls.__name__.rsplit(".", 1)[-1]] = cls
 
     @staticmethod
-    def relprop(lrp_layer, m, relevance_in, method="e-rule"):
+    def relprop(lrp_layer, m, relevance_in, weight_transform=None, eps=1e-6):
         relevance_in = relevance_in.view(m.out_shape)
         with torch.no_grad():
 
             weight = F.relu(m.weight).detach()
 
-            if method == "g-rule":
-                weight = (lrp_layer.GAMMA*weight).detach()
+            if weight_transform is not None and callable(weight_transform):
+                weight = weight_transform(weight).detach()
 
             Z = lrp_layer.forward_pass(m, m.in_tensor, weight).detach()
 
-            #Resize in and out to be same since deconvolution has different size
             Z, R = lrp_layer.reshape(Z, relevance_in)
             del relevance_in
 
-            eps = torch.FloatTensor([lrp_layer.EPSILON if method == "e-rule" else lrp_layer.EPS])
+            eps = torch.FloatTensor([eps])
 
             Z += eps.to(Z.device)
             del eps
@@ -45,17 +44,19 @@ class Rule(object):
 class ERule(Rule):
     @staticmethod
     def relprop(lrp_layer, m, relevance_in):
-        return Rule.relprop(lrp_layer, m, relevance_in, method="e-rule")
+        return Rule.relprop(lrp_layer, m, relevance_in, eps=lrp_layer.EPSILON)
 
 class ZeroRule(Rule):
     @staticmethod
     def relprop(lrp_layer, m, relevance_in):
-        return Rule.relprop(lrp_layer, m, relevance_in, method="0-rule")
+        return Rule.relprop(lrp_layer, m, relevance_in, eps=lrp_layer.EPS)
 
 class GRule(Rule):
     @staticmethod
     def relprop(lrp_layer, m, relevance_in):
-        return Rule.relprop(lrp_layer, m, relevance_in, method="g-rule")
+        weight_transform = lambda w: w*lrp_layer.GAMMA
+        return Rule.relprop(lrp_layer, m, relevance_in, weight_transform=weight_transform,
+            eps=lrp_layer.EPS)
 
 class LayerNumRule(Rule):
     @staticmethod
@@ -63,16 +64,92 @@ class LayerNumRule(Rule):
         layer_level = 1-(m.LAYER_NUM/nlayers)
         if layer_level < 0.2:
             #Upper layers
-            print("Running Rule 0")
             return ZeroRule.relprop(lrp_layer, m, relevance_in)
         elif 0.2<=layer_level<0.5:
             #Middle layers
-            print("Running Rule E")
             return ERule.relprop(lrp_layer, m, relevance_in)
         else:
             #Lower layers
-            print("Running Rule G")
             return GRule.relprop(lrp_layer, m, relevance_in)
+
+class WSquareRule(Rule):
+    @staticmethod
+    def relprop(lrp_layer, m, relevance_in, pow=2):
+        weights = lrp_layer.weight.pow(pow).detach()
+        Y = lrp_layer.forward_pass(m, lrp_layer.in_tensor, weights)
+
+        ones = torch.ones(lrp_layer.in_shape)
+        Z = lrp_layer.forward_pass(m, ones, weights)
+        del ones
+
+        S = S/(Z+lrp_layer.EPS)
+        del Z
+
+        R = lrp_layer.backward_pass(m, lrp_layer.in_tensor+Y+S, weights)
+        del weights, Y, S
+
+        return R.detach()
+
+class FlatRule(Rule):
+    """The flat rule works with weights equal to one and no biases."""
+    def relprop(lrp_layer, m, relevance_in):
+        return WSquareRule.relprop(lrp_layer, m, relevance_in, pow=0)
+
+class TwoLayerSumRule(Rule):
+    def relprop(lrp_layer, m, relevance_in, x1, weight1, x2, weight2):
+        Z1 = lrp_layer.forward_pass(m, x1, weight1)
+        Z2 = lrp_layer.forward_pass(m, x2, w2)
+
+        Z = Z1+Z2
+        S = R/(Z+lrp_layer.EPS)
+
+        C_pos = lrp_layer.backward_pass(m, x1+Z1+S, weight1)
+        C_neg = lrp_layer.backward_pass(m, x2+Z2+S, weight2)
+        del Z1, Z2, Z, S
+
+        R1 = x1*C1
+        R2 = x2*C2
+        del C1, C2
+
+        R = R1+R2
+        del R1, R2
+
+        return R.detach()
+
+class AlphaBetaRule(Rule):
+    def relprop(lrp_layer, m, relevance_in, a=None, b=None):
+        a = a if isinstance(a, (float, int)) else getattr(m, "ALPHA", 1)
+        b = b if isinstance(b, (float, int)) else getattr(b, "BETA", 0)
+
+        x_pos = (m.in_tensor * (m.in_tensor>0).float()).detach()
+        x_neg = (m.in_tensor * (m.in_tensor<0).float()).detach()
+
+        weight_pos = (m.weight * (m.weight>0).float()).detach()
+        weight_neg = (m.weight * (m.weight<0).float()).detach()
+
+        activator_relevances = TwoLayerSumRule.relprop(lrp_layer, m,
+            relevance_in, x_pos, weight_pos, x_neg, weight_neg)
+
+        if b==0:
+            R =  activator_relevances.detach()
+        else:
+            inhibitor_relevances = TwoLayerSumRule.relprop(lrp_layer, m,
+                relevance_in, x_pos, weight_neg, x_neg, weight_pos)
+            R = a*activator_relevances-b*inhibitor_relevances
+            del inhibitor_relevances
+
+        del relevance_in, x_pos, weight_pos, x_neg, weight_neg, activator_relevances
+
+        return R.detach()
+
+class Alpha2Beta1(Rule):
+    def relprop(lrp_layer, m, relevance_in, a=None, b=None):
+        return AlphaBetaRule.relprop(lrp_layer, m, relevance_in, a=2, b=1)
+
+
+class Alpha1Beta0(Rule):
+    def relprop(lrp_layer, m, relevance_in, a=None, b=None):
+        return AlphaBetaRule.relprop(lrp_layer, m, relevance_in, a=1, b=0)
 
 class ZBetaRule(Rule):
     """Z-beta rule from https://github.com/albermax/innvestigate/blob/master/innvestigate/analyzer/relevance_based/relevance_rule.py"""
@@ -81,7 +158,7 @@ class ZBetaRule(Rule):
 
     @staticmethod
     def relprop(lrp_layer, m, relevance_in):
-
+        return relevance_in
         with torch.no_grad():
             if len(ZBetaRule.MIN) == 1:
                 min_ = ZBetaRule.MIN*m.in_shape[1]

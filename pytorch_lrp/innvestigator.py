@@ -43,6 +43,7 @@ class InnvestigateModel(object):
         # super(InnvestigateModel, self).__init__()
         self.model = the_model
         self.prediction = prediction
+        self.in_tensor = None
         self.r_values_per_layer = None
         self.only_max_score = None
 
@@ -56,6 +57,8 @@ class InnvestigateModel(object):
         LRPLayer.EPS = self.eps
         LRPLayer.BETA = self.beta
         LRPLayer.ignore_unsupported_layers = self.ignore_unsupported_layers
+
+        self.hooks = []
 
         # Parsing the individual model layers
         print("Start unravel", cpu_usage(), gpu_usage())
@@ -77,6 +80,7 @@ class InnvestigateModel(object):
         """
         # print(str(parent_module).split("\n")[0], "Layer num", start_index)
         # setattr(parent_module, "LAYER_NUM", start_index)
+        self.hooks = []
         for i, mod in enumerate(parent_module.children()):
             setattr(mod, "LAYER_NUM", start_index+i)
             if list(mod.children()):
@@ -84,9 +88,11 @@ class InnvestigateModel(object):
             else:
                 lrp_layer = LRPLayer.get(mod)
                 if not isinstance(lrp_layer, LRPPassLayer):
-                    mod.register_forward_hook(lrp_layer.forward_hook)
+                    fwd = mod.register_forward_hook(lrp_layer.forward_hook)
+                    self.hooks.append(fwd)
                     if hasattr(lrp_layer, "backward"):
-                        mod.register_backward_hook(lrp_layer.backward_hook)
+                        rev = mod.register_backward_hook(lrp_layer.backward_hook)
+                        self.hooks.append(rev)
 
         return start_index+i+2 if i>0 else start_index+1
 
@@ -115,6 +121,7 @@ class InnvestigateModel(object):
         Returns:
             Model prediction
         """
+        self.in_tensor = in_tensor
         self.prediction = self.model(in_tensor)
         return self.prediction
 
@@ -138,7 +145,8 @@ class InnvestigateModel(object):
 
         return r_values
 
-    def innvestigate(self, in_tensor=None, rel_for_class=None):
+    def innvestigate(self, in_tensor=None, rel_for_class=None, autoencoder_in=False,
+        autoencoder_out=False, clean=True):
         """
         Method for 'innvestigating' the model with the LRP rule chosen at
         the initialization of the InnvestigateModel.
@@ -158,6 +166,10 @@ class InnvestigateModel(object):
         """
         with torch.no_grad():
             # Check if innvestigation can be performed.
+            if not self.hooks:
+                nlayers = self.register_hooks(self.model)
+                LRPLayer.N_LAYERS = nlayers
+
             if in_tensor is None and self.prediction is None:
                 raise RuntimeError("Model needs to be evaluated at least "
                                    "once before an innvestigation can be "
@@ -172,23 +184,26 @@ class InnvestigateModel(object):
 
             # If no class index is specified, analyze for class
             # with highest prediction.
-            if rel_for_class is None:
-                # Default behaviour is innvestigating the output
-                # on an arg-max-basis, if no class is specified.
-                org_shape = self.prediction.size()
-                # Make sure shape is just a 1D vector per batch example.
-                self.prediction = self.prediction.view(org_shape[0], -1)
-                max_v, _ = torch.max(self.prediction, dim=1, keepdim=True)
-                only_max_score = torch.zeros_like(self.prediction)
-                only_max_score[max_v == self.prediction] = self.prediction[max_v == self.prediction]
-                relevance = only_max_score.view(org_shape)
+            if not (autoencoder_in or autoencoder_out):
+                if rel_for_class is None:
+                    # Default behaviour is innvestigating the output
+                    # on an arg-max-basis, if no class is specified.
+                    org_shape = self.prediction.size()
+                    # Make sure shape is just a 1D vector per batch example.
+                    self.prediction = self.prediction.view(org_shape[0], -1)
+                    max_v, _ = torch.max(self.prediction, dim=1, keepdim=True)
+                    only_max_score = torch.zeros_like(self.prediction)
+                    only_max_score[max_v == self.prediction] = self.prediction[max_v == self.prediction]
+                    relevance = only_max_score.view(org_shape)
 
+                else:
+                    org_shape = self.prediction.size()
+                    self.prediction = self.prediction.view(org_shape[0], -1)
+                    only_max_score = torch.zeros_like(self.prediction)
+                    only_max_score[:, rel_for_class] += self.prediction[:, rel_for_class]
+                    relevance = only_max_score.view(org_shape)
             else:
-                org_shape = self.prediction.size()
-                self.prediction = self.prediction.view(org_shape[0], -1)
-                only_max_score = torch.zeros_like(self.prediction)
-                only_max_score[:, rel_for_class] += self.prediction[:, rel_for_class]
-                relevance = only_max_score.view(org_shape)
+                relevance = self.in_tensor[1] if autoencoder_in else self.prediction
 
             lrp_module = LRPLayer.get(self.model)
             lrp_module.NORMALIZE_BEFORE = True
@@ -196,7 +211,7 @@ class InnvestigateModel(object):
 
             torch.cuda.empty_cache()
 
-            relevance_out = lrp_module.relprop_(self.model, relevance)
+            relevance_out = lrp_module.relprop_(self.model, relevance, clean=clean)
 
             torch.cuda.empty_cache()
 
@@ -214,10 +229,15 @@ class InnvestigateModel(object):
 
                 self.r_values_per_layer = r_values_per_layer
 
-            return self.prediction, relevance_out
+            return self.prediction, relevance_out, max_v
 
     def forward(self, in_tensor):
         return self.model.forward(in_tensor)
+
+    def clean(self):
+        for hook in self.hooks:
+            hook.remove()
+        self.prediction = None
 
     def extra_repr(self):
         r"""Set the extra representation of the module
