@@ -14,9 +14,7 @@ You can use the visualization methods in this repository on your own model (PyTo
     model = Net()
     model.load_state_dict(torch.load("./mymodel"))
     # Convert to innvestigate model
-    inn_model = InnvestigateModel(model, lrp_exponent=2,
-                                  method="e-rule",
-                                  beta=.5)
+    inn_model = InnvestigateModel(model, lrp_exponent=2, beta=.5)
     model_prediction, heatmap = inn_model.innvestigate(in_tensor=data)
 
 `heatmap` contains the relevance heatmap. The methods should work for 2D and 3D images alike, see the MNIST example notebook or the LRP and GB evaluation notebook for an example with MRI images.
@@ -28,20 +26,51 @@ The repository consists of the general LRP wrapper (innvestigator.py), a LRP mod
 
 ## Extending to include new LRP modules
 
-To create a new LRP module, subclass the LRPLayer class, and ovveride the forward method to capture the forward hooks and relprop to perform relevance propagtion:
+### To create a new LRP module, subclass the LRPFunctionLayer class, and overide the forwar_pass and backward_pass static methods: ###
 
 ```python
-from torch import nn
+import torch.nn
 from pytorch_lrp.modules import LRPLayer
-class LSTM(LRPLayer, layer_class=nn.LSTM):
-    def forward(self, m, in_tensor: torch.Tensor,
-      out_tensor: torch.Tensor):
-        #Register forward hooks
-        return super().forward(m, in_tensor, out_tensor)
+class LSTM(LRPFunctionLayer, layer_class=torch.nn.LSTM):
+    @staticmethod
+    def forward_pass(m, tensor, weight, bias=None):
+        #Insert forward pass code
+        output = None
+        return output
+    
+    @staticmethod
+    def backward_pass(m, tensor, weight):
+        #Insert backward pass code
+        output = None
+        return output
+```
 
-    def relprop(self, m, relevance_in):
+### For more advanced methods: ###
+    1) Save input and output tensor: overide the forward_hook class method to capture the forward hooks 
+
+```python
+class LSTM(LRPFunctionLayer, layer_class=torch.nn.LSTM):
+    @staticmethod
+    def forward_hook(m, in_tensor: torch.Tensor, out_tensor: torch.Tensor):
+        """Note: to use the rules correctly, you must save:
+            - in_shape
+            - in_tensor
+            - out_shape
+        """
+        #Use setattr to make sure it get attached to module m
+        setattr(m, 'in_shape', in_tensor[0].size())
+        return None #Change here to modify input
+```
+    2) Change relevance propagation code (bypass rules)
+        
+```python
+class LSTM(LRPFunctionLayer, layer_class=torch.nn.LSTM):
+    @classmethod
+    def relprop(cls, m, relevance_in):
         #Perform relevance propagation
         return relevance_in
+    
+    #... other subclass code
 ```
 
 To add new allowable skip layers, subclass LRPPassLayer and add classes to the ALLOWED_PASS_LAYERS property:
