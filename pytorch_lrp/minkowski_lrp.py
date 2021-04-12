@@ -8,6 +8,7 @@ from more_itertools import pairwise
 from .modules import LRPLayer, LRPFunctionLayer, LRPPassLayer
 
 import MinkowskiEngine as ME
+from MinkowskiEngine.MinkowskiSparseTensor import _get_coordinate_map_key
 from MinkowskiEngine.Common import convert_to_int_list, get_minkowski_function
 from MinkowskiEngine.modules.resnet_block import BasicBlock, Bottleneck
 
@@ -15,8 +16,7 @@ def _get_coords_key(
         input: ME.SparseTensor,
         coords: Union[torch.IntTensor, ME.CoordsKey, ME.SparseTensor] = None,
         tensor_stride: Union[Sequence, np.ndarray, torch.IntTensor] = 1):
-    r"""Process coords according to its type.
-    """
+    r"""Process coords according to its type."""
     if coords is not None:
         assert isinstance(coords, (ME.CoordsKey, torch.IntTensor, ME.SparseTensor))
         if isinstance(coords, torch.IntTensor):
@@ -74,24 +74,12 @@ class MinkwoskiLRPFunctionLayer(LRPFunctionLayer):
         setattr(m, 'out_shape', out_tensor.F.size())
         setattr(m, "out_coords", out_tensor.C)
 
-        try:
-            region_type_, region_offset_, _ = \
-                m.kernel_generator.get_kernel(in_tensor[0].tensor_stride, m.is_transpose)
-        except torch.nn.modules.module.ModuleAttributeError:
-            #Not a Conv or linear layer
-            region_type_, region_offset_ = None, None
-
-        out_coords_key = _get_coords_key(in_tensor[0], None)
-
+        out_coordinate_map_key = _get_coordinate_map_key(input, coordinates)
 
         setattr(m, "tensor_stride", in_tensor[0].tensor_stride)
-        setattr(m, "coords_key", in_tensor[0].coords_key)
-        setattr(m, "out_coords_key", out_coords_key)
-        setattr(m, "coords_man", in_tensor[0].coords_man)
-        setattr(m, "region_type", region_type_)
-        setattr(m, "region_offset", region_offset_)
-
-
+        setattr(m, "in_coordinate_map_key", in_tensor[0].coordinate_map_key)
+        setattr(m, "out_coordinate_map_key", out_coordinate_map_key)
+        setattr(m, "coordinate_manager", in_tensor[0]._manager)
 
         return None
 
@@ -99,8 +87,8 @@ class MinkwoskiLRPFunctionLayer(LRPFunctionLayer):
     def clean(m, force=False):
         if force:
             del m.in_shape, m.in_tensor, m.out_tensor, m.out_shape, \
-                m.tensor_stride, m.coords_key, m.out_coords_key, m.coords_man, \
-                m.region_type, m.region_offset
+                m.tensor_stride, m.in_coordinate_map_key, m.out_coordinate_map_key, \
+                m.coordinate_manager
 
 class MinkLinear(MinkwoskiLRPFunctionLayer, layer_class=ME.MinkowskiLinear):
     @staticmethod
@@ -161,11 +149,13 @@ class MinkGlobalPooling(MinkwoskiLRPFunctionLayer, layer_class=ME.MinkowskiGloba
             input_features = in_tensor.contiguous()
 
             fw_fn = get_minkowski_function('GlobalPoolingForward', input_features)
-            out_feat, num_nonzero = fw_fn(input_features,
-                                          m.coords_key.CPPCoordsKey,
-                                          m.out_coords_key.CPPCoordsKey,
-                                          m.coords_man.CPPCoordsManager,
-                                          m.average, m.mode.value)
+            out_feat, num_nonzero = fw_fn(
+                input_features,
+                m.pooling_mode,
+                m.in_coordinate_map_key,
+                m.out_coordinate_map_key,
+                m.coordinate_manager._manager
+            )
 
             setattr(m, "num_nonzero", num_nonzero)
 
@@ -177,10 +167,15 @@ class MinkGlobalPooling(MinkwoskiLRPFunctionLayer, layer_class=ME.MinkowskiGloba
             grad_out_feat = tensor.contiguous()
 
             bw_fn = get_minkowski_function('GlobalPoolingBackward', grad_out_feat)
-            grad_in_feat = bw_fn(m.in_tensor, grad_out_feat, m.num_nonzero,
-                                 m.coords_key.CPPCoordsKey,
-                                 m.out_coords_key.CPPCoordsKey,
-                                 m.coords_man.CPPCoordsManager, m.average)
+            grad_in_feat = bw_fn(
+                m.in_tensor,
+                grad_out_feat,
+                m.num_nonzero,
+                m.pooling_mode,
+                m.in_coordinate_map_key,
+                m.out_coordinate_map_key,
+                m.coords_manager._manager
+            )
 
             return grad_in_feat.detach()
 
@@ -208,18 +203,21 @@ class MinkConvolution(MinkwoskiLRPFunctionLayer, layer_class=ME.MinkowskiConvolu
             if not input_features.is_contiguous():
                 input_features = input_features.contiguous()
 
-            D = m.coords_key.D
-            out_feat = input_features.new()
-
-            fw_fn = get_minkowski_function('ConvolutionForward',
-                                           input_features)
-            fw_fn(input_features, out_feat, weight,
-                  convert_to_int_list(m.tensor_stride, D),
-                  convert_to_int_list(m.stride, D),
-                  convert_to_int_list(m.kernel_size, D),
-                  convert_to_int_list(m.dilation, D), m.region_type, m.region_offset,
-                  m.coords_key.CPPCoordsKey, m.out_coords_key.CPPCoordsKey,
-                  m.coords_man.CPPCoordsManager)
+            fw_fn = get_minkowski_function('ConvolutionForward', input_features)
+            out_feat = fw_fn(
+                input_features,
+                m.kernel,
+                m.kernel_generator.kernel_size,
+                m.kernel_generator.kernel_stride,
+                m.kernel_generator.kernel_dilation,
+                m.kernel_generator.region_type,
+                m.kernel_generator.region_offsets,
+                m.kernel_generator.expand_coordinates,
+                m.convolution_mode,
+                m.in_coordinate_map_key,
+                m.out_coordinate_map_key,
+                m.coordinate_manager._manager
+            )
 
             out_feat.detach()
 
@@ -232,17 +230,21 @@ class MinkConvolution(MinkwoskiLRPFunctionLayer, layer_class=ME.MinkowskiConvolu
             if not grad_out_feat.is_contiguous():
                 grad_out_feat = grad_out_feat.contiguous()
 
-            grad_in_feat = grad_out_feat.new()
-            grad_kernel = grad_out_feat.new()
-            D = m.coords_key.D
             bw_fn = get_minkowski_function('ConvolutionBackward', grad_out_feat)
-            bw_fn(m.in_tensor, grad_in_feat, grad_out_feat, weight, grad_kernel,
-                  convert_to_int_list(m.tensor_stride, D),
-                  convert_to_int_list(m.stride, D),
-                  convert_to_int_list(m.kernel_size, D),
-                  convert_to_int_list(m.dilation, D), m.region_type,
-                  m.coords_key.CPPCoordsKey, m.out_coords_key.CPPCoordsKey,
-                  m.coords_man.CPPCoordsManager)
+            grad_in_feat, grad_kernel = bw_fn(
+                m.in_tensor,
+                grad_out_feat,
+                m.kernel,
+                m.kernel_generator.kernel_size,
+                m.kernel_generator.kernel_stride,
+                m.kernel_generator.kernel_dilation,
+                m.kernel_generator.region_type,
+                m.kernel_generator.region_offsets,
+                m.convolution_mode,
+                m.in_coordinate_map_key,
+                m.out_coordinate_map_key,
+                m.coordinate_manager._manager
+            )
 
             grad_in_feat.detach()
 
@@ -267,28 +269,30 @@ class  MinkConvolutionTranspose(MinkwoskiLRPFunctionLayer, layer_class=ME.Minkow
 
     @staticmethod
     def forward_pass(m, in_tensor, weight, bias=None, scale_groups=1):
-        with torch.no_grad():
-            input_features = in_tensor
+        input_features = in_tensor
 
-            if not input_features.is_contiguous():
-                input_features = input_features.contiguous()
+        if not input_features.is_contiguous():
+            input_features = input_features.contiguous()
 
-            D = m.coords_key.D
-            out_feat = input_features.new()
+        fw_fn = get_minkowski_function('ConvolutionTransposeForward', input_features)
+        out_feat = fw_fn(
+            input_features,
+            m.kernel,
+            m.kernel_generator.kernel_size,
+            m.kernel_generator.kernel_stride,
+            m.kernel_generator.kernel_dilation,
+            m.kernel_generator.region_type,
+            m.kernel_generator.region_offsets,
+            m.kernel_generator.expand_coordinates,
+            m.convolution_mode,
+            m.in_coordinate_map_key,
+            m.out_coordinate_map_key,
+            m.coordinate_manager._manager
+        )
 
-            fw_fn = get_minkowski_function('ConvolutionTransposeForward',
-                                           input_features)
-            fw_fn(input_features, out_feat, weight,
-                  convert_to_int_list(m.tensor_stride, D),
-                  convert_to_int_list(m.stride, D),
-                  convert_to_int_list(m.kernel_size, D),
-                  convert_to_int_list(m.dilation, D), m.region_type, m.region_offset,
-                  m.coords_key.CPPCoordsKey, m.out_coords_key.CPPCoordsKey,
-                  m.coords_man.CPPCoordsManager, m.generate_new_coords)
+        out_feat.detach()
 
-            out_feat.detach()
-
-            return out_feat
+        return out_feat
 
     @staticmethod
     def backward_pass(m, in_tensor, weight, bias=None):
@@ -297,20 +301,24 @@ class  MinkConvolutionTranspose(MinkwoskiLRPFunctionLayer, layer_class=ME.Minkow
             if not grad_out_feat.is_contiguous():
                 grad_out_feat = grad_out_feat.contiguous()
 
-            grad_in_feat = grad_out_feat.new()
-            grad_kernel = grad_out_feat.new()
-            D = m.coords_key.D
             bw_fn = get_minkowski_function('ConvolutionTransposeBackward', grad_out_feat)
-            bw_fn(m.in_tensor, grad_in_feat, grad_out_feat, weight, grad_kernel,
-                  convert_to_int_list(m.tensor_stride, D),
-                  convert_to_int_list(m.stride, D),
-                  convert_to_int_list(m.kernel_size, D),
-                  convert_to_int_list(m.dilation, D), m.region_type,
-                  m.coords_key.CPPCoordsKey, m.out_coords_key.CPPCoordsKey,
-                  m.coords_man.CPPCoordsManager)
+            grad_in_feat, grad_kernel = bw_fn(
+                m.in_tensor,
+                grad_out_feat,
+                m.kernel,
+                m.kernel_generator.kernel_size,
+                m.kernel_generator.kernel_stride,
+                m.kernel_generator.kernel_dilation,
+                m.kernel_generator.region_type,
+                m.kernel_generator.region_offsets,
+                m.convolution_mode,
+                m.in_coordinate_map_key,
+                m.out_coordinate_map_key,
+                m.coordinate_manager._manager
+            )
 
             grad_in_feat.detach()
 
-            assert grad_in_feat.size() == m.in_shape, (grad_in_feat.size(), m.in_shape, m.in_coords.size())
+            assert grad_in_feat.size() == m.in_shape, (grad_in_feat.size(), m.in_shape(), m.out_shape, m.in_coords.size())
 
             return grad_in_feat
