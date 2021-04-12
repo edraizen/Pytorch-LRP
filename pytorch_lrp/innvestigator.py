@@ -2,7 +2,7 @@ import time
 import torch
 import numpy as np
 
-from .modules import LRPLayer, LRPPassLayer, cpu_usage, gpu_usage
+from .modules import LRPLayer, LRPPassLayer, LRPFunctionLayer, cpu_usage, gpu_usage
 
 class InnvestigateModel(object):
     """
@@ -14,7 +14,7 @@ class InnvestigateModel(object):
     """
 
     def __init__(self, the_model, lrp_exponent=1, beta=.5, epsilon=1e-6,
-                 prediction=None, ignore_unsupported_layers=False):
+                 prediction=None, ignore_unsupported_layers=False, rule=None):
         """
         Model wrapper for pytorch models to 'innvestigate' them
         with layer-wise relevance propagation (LRP) as introduced by Bach et. al
@@ -58,6 +58,9 @@ class InnvestigateModel(object):
         LRPLayer.BETA = self.beta
         LRPLayer.ignore_unsupported_layers = self.ignore_unsupported_layers
 
+        if rule is not None:
+            LRPLayer.DEFAULT_RULE = rule
+
         self.hooks = []
 
         # Parsing the individual model layers
@@ -81,19 +84,24 @@ class InnvestigateModel(object):
         # print(str(parent_module).split("\n")[0], "Layer num", start_index)
         # setattr(parent_module, "LAYER_NUM", start_index)
         self.hooks = []
+        start = False
         for i, mod in enumerate(parent_module.children()):
-            setattr(mod, "LAYER_NUM", start_index+i)
-            if list(mod.children()):
+            lrp_layer = LRPLayer.get(mod, raise_if_unknown=False)
+            if list(mod.children()) and (lrp_layer is None or not issubclass(lrp_layer, LRPFunctionLayer)):
                 start_index = self.register_hooks(mod, start_index=start_index+i+1)
             else:
-                lrp_layer = LRPLayer.get(mod)
                 if not isinstance(lrp_layer, LRPPassLayer):
                     fwd = mod.register_forward_hook(lrp_layer.forward_hook)
                     self.hooks.append(fwd)
                     if hasattr(lrp_layer, "backward"):
                         rev = mod.register_backward_hook(lrp_layer.backward_hook)
                         self.hooks.append(rev)
+                    if not start and start_index == 1 and not isinstance(lrp_layer, NoCountLRPLayer):
+                        lrp_layer.FIRST_LAYER = True
+                        start = True
 
+        if start_index ==1:
+            import pdb; pdb.set_trace()
         return start_index+i+2 if i>0 else start_index+1
 
     def __call__(self, in_tensor):
@@ -145,8 +153,8 @@ class InnvestigateModel(object):
 
         return r_values
 
-    def innvestigate(self, in_tensor=None, rel_for_class=None, autoencoder_in=False,
-        autoencoder_out=False, clean=True):
+    def innvestigate(self, in_tensor=None, no_recalc=False, rel_for_class=None, autoencoder_in=False,
+        autoencoder_out=False, rule=None, clean=True):
         """
         Method for 'innvestigating' the model with the LRP rule chosen at
         the initialization of the InnvestigateModel.
@@ -178,9 +186,13 @@ class InnvestigateModel(object):
                                    "evaluate.")
 
             print("Start InnvestigateModel", cpu_usage(), gpu_usage())
+
             # Evaluate the model anew if a new input is supplied.
             if in_tensor is not None:
-                self.evaluate(in_tensor)
+                if not no_recalc:
+                    self.evaluate(in_tensor)
+                else:
+                    self.in_tensor = in_tensor
 
             # If no class index is specified, analyze for class
             # with highest prediction.
@@ -202,6 +214,8 @@ class InnvestigateModel(object):
                     only_max_score = torch.zeros_like(self.prediction)
                     only_max_score[:, rel_for_class] += self.prediction[:, rel_for_class]
                     relevance = only_max_score.view(org_shape)
+            elif no_recalc:
+                relevance = self.in_tensor
             else:
                 relevance = self.in_tensor[1] if autoencoder_in else self.prediction
 
@@ -209,15 +223,16 @@ class InnvestigateModel(object):
             lrp_module.NORMALIZE_BEFORE = True
             lrp_module.NORMALIZE_AFTER = True
 
+            if rule is not None:
+                lrp_module.DEFAULT_RULE = rule
+
             torch.cuda.empty_cache()
 
-            relevance_out = lrp_module.relprop_(self.model, relevance, clean=clean)
+            relevance_out = lrp_module.relprop_(self.model, relevance, rule=rule, clean=clean)
 
             torch.cuda.empty_cache()
 
             del lrp_module
-
-            print("RELEVANCE =", relevance_out)
 
             if False:
                 # List to save relevance distributions per layer
@@ -229,7 +244,7 @@ class InnvestigateModel(object):
 
                 self.r_values_per_layer = r_values_per_layer
 
-            return self.prediction, relevance_out, max_v
+            return self.prediction, relevance_out
 
     def forward(self, in_tensor):
         return self.model.forward(in_tensor)

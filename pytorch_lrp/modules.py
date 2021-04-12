@@ -4,8 +4,9 @@ import time
 import numpy as np
 import torch.nn.functional as F
 import psutil
+from torch import autograd
 
-from .rules import RULES
+from .rules import RULES, Rule
 
 ALLOWED_LAYERS = []
 ALLOWED_LAYERS_BY_NAME = {}
@@ -14,6 +15,8 @@ ALLOWED_PASS_LAYERS = [c.__name__ for c in (
     torch.nn.BatchNorm1d, torch.nn.BatchNorm2d, torch.nn.BatchNorm3d,
     torch.nn.ELU, torch.nn.Dropout, torch.nn.Dropout2d, torch.nn.Dropout3d,
     torch.nn.Softmax, torch.nn.Sigmoid)]
+
+TENSOR_CONV_TYPES = {torch.Tensor: {"from":lambda old: old, "to":lambda m, old, new: new}}
 
 def sizeof_fmt(num, suffix='B'):
     for unit in ['','Ki','Mi','Gi','Ti','Pi','Ei','Zi']:
@@ -34,11 +37,14 @@ def gpu_usage():
 class LRPLayer(object):
     #Layer specific, subclasses can change these
     RULE = None
+    DEFAULT_RULE = "Alpha1Beta0"
     NORMALIZE_BEFORE = False #True
     NORMALIZE_AFTER = False #True
 
     LAYER_NUM = None
     N_LAYERS = None
+    SKIP_COUNT = False
+    FIRST_LAYER = False
 
     #Normalization parameters
     NORMALIZE_METHOD = "fraction_clamp_filter"
@@ -69,6 +75,11 @@ class LRPLayer(object):
             ALLOWED_PASS_LAYERS += [c.__name__ for c in cls.ALLOWED_PASS_LAYERS]
             del cls.ALLOWED_PASS_LAYERS
 
+        if hasattr(cls, "TENSOR_CONV_TYPES") and isinstance(
+          cls.TENSOR_CONV_TYPES, dict):
+            global TENSOR_CONV_TYPES
+            TENSOR_CONV_TYPES.update(cls.TENSOR_CONV_TYPES)
+
     @classmethod
     def forward_pass_(cls, m, in_tensor: torch.Tensor,
       out_tensor: torch.Tensor):
@@ -88,22 +99,64 @@ class LRPLayer(object):
         return
 
     @classmethod
-    def relprop_(cls, m, relevance_in, clean=True):
-        if cls.NORMALIZE_BEFORE:
-            relevance_in = cls.relnormalize(relevance_in)
+    def relprop_(cls, m, relevance_in, rule=None, clean=True):
         name = str(m).split("\n")[0]
+
+        if issubclass(cls, LRPPassLayer):
+            return relevance_in
+
         if issubclass(cls, LRPFunctionLayer):
-            if cls.RULE is None:
-                relevance = RULES["LayerNumRule"].relprop(cls, m, relevance_in, LRPLayer.N_LAYERS)
+            if isinstance(relevance_in, tuple(TENSOR_CONV_TYPES.keys())):
+                relevance = TENSOR_CONV_TYPES[type(relevance_in)]["from"](relevance_in)
             else:
-                relevance = RULES.get(cls.RULE, "ERule").relprop(cls, m, relevance_in)
-        elif cls.RULE is not None and cls.RULE in RULES:
-            relevance = RULES[cls.RULE].relprop(cls, m, relevance_in)
-        else:
+                raise RuntimeError(f"Relevence must be a tensor, not {type(relevance_in)}. If using custom function, be sure to include a TENSOR_CONV_TYPES class atrribute with to and from keys to function. Current options are: {list(TENSOR_CONV_TYPES.keys())}")
+        elif cls.relprop != LRPLayer.relprop:
+            #Use subclasses relprop, not a rule
             relevance = cls.relprop(m, relevance_in)
+            return relevance
+        else:
+            raise
+
+        if cls.NORMALIZE_BEFORE:
+            relevance = cls.relnormalize(relevance)
+
+        with autograd.detect_anomaly():
+            # if cls.relprop != LRPLayer.relprop:
+            #     #Use subclasses relprop, not a rule
+            #     print(cls, LRPLayer, cls.__code__==LRPLayer.__code__, cls.__code__, LRPLayer.__code__)
+            #     print("Using subclassed relprop")
+            #     relevance = cls.relprop(m, relevance)
+            if cls.RULE is not None and cls.RULE in RULES:
+                relevance = RULES[cls.RULE].relprop(cls, m, relevance)
+            elif issubclass(cls, LRPFunctionLayer):
+                if rule is not None and (issubclass(rule, Rule) or rule in RULES):
+                    #Use custom rule given as input to relprop
+                    relevence = rule.relprop(cls, m, relevance)
+                else:
+                    #Use default Rule
+                    relevance = RULES[cls.DEFAULT_RULE].relprop(cls, m, relevance)
+                # if cls.RULE is None:
+                #     relevance = RULES["LayerNumRule"].relprop(cls, m, relevance_in, LRPLayer.N_LAYERS)
+                # else:
+                #     relevance = RULES.get(cls.RULE, "ERule").relprop(cls, m, relevance_in)
+            else:
+                # relevance = cls.relprop(m, relevance)
+                print("Skipping???")
+
+        if isinstance(relevance, torch.Tensor):
+            if not issubclass(cls, LRPPassLayer):
+                assert not torch.isnan(relevance).any(), "Is Nan: {} {} \n Rel in {}".format(cls.__name__, relevance, relevance)
+        elif isinstance(relevance, (list, tuple)):
+            for r in relevance:
+                if isinstance(r, torch.Tensor) and not issubclass(cls, LRPPassLayer):
+                    assert not torch.isnan(r).any(), "Is Nan: {} {} \n Rel in {}".format(cls.__name__, r, relevance)
+
 
         if cls.NORMALIZE_AFTER:
             relevance = cls.relnormalize(relevance)
+
+        relevance = TENSOR_CONV_TYPES[type(relevance_in)]["to"](m, relevance_in, relevance)
+
 
         del relevance_in
         #setattr(m, "relevance", relevance)
@@ -116,16 +169,22 @@ class LRPLayer(object):
 
     @classmethod
     def relprop(cls, m, relevance_in):
-        return relevance_in.detach()
+        return relevance_in
 
     @classmethod
-    def relnormalize(cls, relevance):
+    def relnormalize(cls, relevance_in):
         """Modified from github repo etjoa003/medical_imaging:
         https://github.com/etjoa003/medical_imaging/blob/master/isles2017/models/networks.py"""
-        if isinstance(relevance, (list, tuple)):
-            out = [cls.relnormalize(r) for r in relevance]
-            del relevance
+        if isinstance(relevance_in, (list, tuple)):
+            out = [cls.relnormalize(r) for r in relevance_in]
+            del relevance_in
             return out
+
+        # if isinstance(relevance_in, tuple(TENSOR_CONV_TYPES.keys())):
+        #     relevance = TENSOR_CONV_TYPES[type(relevance_in)]["from"](relevance_in)
+        # else:
+        #     raise RuntimeError("Relevence must be a tensor. If using custom function, be sure to include a TENSOR_CONV_TYPES class atrribute with to and from keys to functions")
+        relevance = relevance_in
 
         if cls.NORMALIZE_METHOD in [None, 'raw']:
             return relevance.detach()
@@ -160,10 +219,14 @@ class LRPLayer(object):
         else:
             raise Exception('Invalid normalization method {}'.format(self.NORMALIZE_METHOD))
 
-        return normalized_rel.detach()
+        normalized_rel = normalized_rel.detach()
+
+        #normalized_rel = TENSOR_CONV_TYPES[type(relevance_in)]["to"](relevance_in, normalized_rel)
+
+        return normalized_rel
 
     @staticmethod
-    def get(layer):
+    def get(layer, raise_if_unknown=True):
         #print(globals())
         try:
             #Class is key
@@ -188,13 +251,16 @@ class LRPLayer(object):
                         return Container
                     elif not LRPLayer.ignore_unsupported_layers:
                         return LRPPassLayer
-                    else:
+                    elif raise_if_unknown:
                         raise NotImplementedError("The network contains layers that"
                                                   " are currently not supported {0:s}".format(str(layer)))
 
 class LRPPassLayer(LRPLayer):
     #Add layer classes here to ignore them
     ALLOWED_PASS_LAYERS = []
+
+class NoCountLRPLayer(LRPLayer):
+    pass
 
 class LRPFunctionLayer(LRPLayer):
     """Placeholder to distiguish function or Sequential modules"""
@@ -217,10 +283,22 @@ class LRPFunctionLayer(LRPLayer):
 class Module(LRPLayer, layer_class=torch.nn.Module):
     @classmethod
     def relprop(cls, module, relevance_in):
+        start_encoder = False
         with torch.no_grad():
-            for m in reversed(list(module.children())):
-                relevance_in = LRPLayer.get(m).relprop_(m, relevance_in).detach()
-        return relevance_in.detach()
+            for n, m in reversed(list(module.named_children())):
+                if n=="linear_log_var":
+                    continue
+
+                if n=="linear_mean":
+                    start_encoder = True
+
+                if not start_encoder:
+                    continue
+
+                l = LRPLayer.get(m)
+
+                relevance_in = l.relprop_(m, relevance_in)
+        return relevance_in
 
 class Container(LRPLayer, layer_class=torch.nn.Container):
     @classmethod

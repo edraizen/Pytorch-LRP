@@ -2,7 +2,7 @@ import torch
 import numpy as np
 import torch.nn.functional as F
 from more_itertools import pairwise
-from .modules import LRPLayer, LRPFunctionLayer, LRPPassLayer, Container
+from .modules import LRPLayer, LRPFunctionLayer, LRPPassLayer, Container, NoCountLRPLayer
 from .modules import ReLU as _ReLU
 
 import sparseconvnet as scn
@@ -19,9 +19,15 @@ class _(LRPPassLayer):
     ALLOWED_PASS_LAYERS = [scn.Tanh, scn.Sigmoid, scn.ELU, scn.SELU,
                            scn.BatchNormELU, scn.BatchNormalization,
                            scn.Dropout, scn.BatchwiseDropout, scn.Identity,
-                           scn.OutputLayer]
+                           scn.InputLayer, scn.OutputLayer,
+                           scn.BatchNormReLU,
+                           scn.BatchNormLeakyReLU,
+                           scn.MeanOnlyBNLeakyReLU]
 
 class SparseLRPLayer(LRPLayer):
+    pass
+
+class NoCountSparseLRPLayer(NoCountLRPLayer):
     pass
 
 class SparseLRPFunctionLayer(LRPFunctionLayer):
@@ -48,42 +54,43 @@ class SparseLRPFunctionLayer(LRPFunctionLayer):
         del in_tensor, relevance_in
         return Z, R
 
-class InputLayer(SparseLRPLayer, layer_class=scn.InputLayer):
-    RULE = "ZBetaRule"
-
-    @staticmethod
-    def forward_hook(m, in_tensor: torch.Tensor, out_tensor: torch.Tensor):
-        setattr(m, 'in_tensor', in_tensor[0])
-        setattr(m, 'in_shape', in_tensor[0][1].size())
-        setattr(m, 'metadata', out_tensor.metadata)
-
-    @staticmethod
-    def clean(m, force=False):
-        if force:
-            del m.in_tensor, m.in_shape, m.metadata
-
-    @staticmethod
-    def forward_pass(m, in_tensor):
-        with torch.no_grad():
-            return scn.ioLayers.InputLayerFunction.apply(
-                m.dimension,
-                Metadata(m.dimension),
-                m.spatial_size,
-                in_tensor[0].cpu().long(),
-                in_tensor[1],
-                0 if len(in_tensor) == 2 else in_tensor[2],
-                m.mode
-            ).detach()
-
-    @staticmethod
-    def backward_pass(m, tensor):
-        with torch.no_grad():
-            grad_input = tensor.new()
-            scn.SCN.InputLayer_updateGradInput(
-                m.metadata,
-                grad_input,
-                tensor.contiguous())
-        return grad_input.detach()
+# class InputLayer(NoCountSparseLRPLayer, layer_class=scn.InputLayer):
+#     #RULE = "WSquareRule" #"ZBetaRule"
+#     SKIP_COUNT = True
+#
+#     @staticmethod
+#     def forward_hook(m, in_tensor: torch.Tensor, out_tensor: torch.Tensor):
+#         setattr(m, 'in_tensor', in_tensor[0])
+#         setattr(m, 'in_shape', in_tensor[0][1].size())
+#         setattr(m, 'metadata', out_tensor.metadata)
+#
+#     @staticmethod
+#     def clean(m, force=False):
+#         if force:
+#             del m.in_tensor, m.in_shape, m.metadata
+#
+#     @staticmethod
+#     def forward_pass(m, in_tensor):
+#         with torch.no_grad():
+#             return scn.ioLayers.InputLayerFunction.apply(
+#                 m.dimension,
+#                 Metadata(m.dimension),
+#                 m.spatial_size,
+#                 in_tensor[0].cpu().long(),
+#                 in_tensor[1],
+#                 0 if len(in_tensor) == 2 else in_tensor[2],
+#                 m.mode
+#             ).detach()
+#
+#     @staticmethod
+#     def backward_pass(m, tensor):
+#         with torch.no_grad():
+#             grad_input = tensor.new()
+#             scn.SCN.InputLayer_updateGradInput(
+#                 m.metadata,
+#                 grad_input,
+#                 tensor.contiguous())
+#         return grad_input.detach()
 
 class ReLU(_ReLU, layer_class=scn.ReLU):
     @staticmethod
@@ -96,14 +103,14 @@ class ReLU(_ReLU, layer_class=scn.ReLU):
 class LeakyReLU(ReLU, layer_class=scn.LeakyReLU):
     pass
 
-class BatchNormReLU(ReLU, layer_class=scn.BatchNormReLU):
-    pass
-
-class BatchNormLeakyReLU(ReLU, layer_class=scn.BatchNormLeakyReLU):
-    pass
-
-class MeanOnlyBNLeakyReLU(ReLU, layer_class=scn.MeanOnlyBNLeakyReLU):
-    pass
+# class BatchNormReLU(ReLU, layer_class=scn.BatchNormReLU):
+#     pass
+#
+# class BatchNormLeakyReLU(ReLU, layer_class=scn.BatchNormLeakyReLU):
+#     pass
+#
+# class MeanOnlyBNLeakyReLU(ReLU, layer_class=scn.MeanOnlyBNLeakyReLU):
+#     pass
 
 class MaxPooling(SparseLRPFunctionLayer, layer_class=scn.MaxPooling):
     @staticmethod
@@ -173,6 +180,8 @@ class Convolution(SparseLRPFunctionLayer, layer_class=scn.Convolution):
 class SubmanifoldConvolution(SparseLRPFunctionLayer, layer_class=scn.SubmanifoldConvolution):
     """Dense Convolutions with size 3, stride 1, padding 1 can be replace by
     scn.SubmanifoldConvolutions"""
+    NORMALIZE_BEFORE = True
+    NORMALIZE_AFTER = True
 
     @staticmethod
     def forward_pass(m, in_tensor, weight, bias=None, scale_groups=1):
@@ -318,7 +327,7 @@ class ConcatTable(SparseLRPLayer, layer_class=scn.ConcatTable):
         def centre_crop_tensor(relevance_in, intended_shape):
             relavance_count = relevance_in.size()[1]
             correct_count = intended_shape[1]
-            start = int(np.floor(np.abs(relavance_count-correct_count)/2) )
+            start = int(np.floor(np.abs(relavance_count-correct_count)/2))
             stop = int(relavance_count-np.ceil(np.abs(relavance_count-correct_count)/2))
             assert stop-start == correct_count, (stop-start, correct_count)
             return relevance_in[:, start:stop]
@@ -328,9 +337,12 @@ class ConcatTable(SparseLRPLayer, layer_class=scn.ConcatTable):
                 zip(relevance_in, m._modules.values())]
             del relevance_in
 
+            print("JOINT TABLE", relevances)
+
             if nIn == 2: # and isinstance(m._modules['0'], scn.Identity):
-                relevance_out = factor*relevances[0] + (1-factor)*centre_crop_tensor(
-                    relevances[1], relevances[0].size())
+                #relevance_out = factor*relevances[0] + (1-factor)*centre_crop_tensor(
+                #    relevances[1], relevances[0].size())
+                relevance_out = centre_crop_tensor(relevances[1], relevances[0].size())
             else:
                 relevance_out, _ = torch.stack(relevances).max(dim=0)
                 del _
