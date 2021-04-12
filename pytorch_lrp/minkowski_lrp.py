@@ -9,30 +9,7 @@ from .modules import LRPLayer, LRPFunctionLayer, LRPPassLayer
 
 import MinkowskiEngine as ME
 from MinkowskiEngine.MinkowskiSparseTensor import _get_coordinate_map_key
-from MinkowskiEngine.Common import convert_to_int_list, get_minkowski_function
 from MinkowskiEngine.modules.resnet_block import BasicBlock, Bottleneck
-
-def _get_coords_key(
-        input: ME.SparseTensor,
-        coords: Union[torch.IntTensor, ME.CoordsKey, ME.SparseTensor] = None,
-        tensor_stride: Union[Sequence, np.ndarray, torch.IntTensor] = 1):
-    r"""Process coords according to its type."""
-    if coords is not None:
-        assert isinstance(coords, (ME.CoordsKey, torch.IntTensor, ME.SparseTensor))
-        if isinstance(coords, torch.IntTensor):
-            coords_key = input.coords_man.create_coords_key(
-                coords,
-                tensor_stride=tensor_stride,
-                force_creation=True,
-                force_remap=True,
-                allow_duplicate_coords=True)
-        elif isinstance(coords, ME.SparseTensor):
-            coords_key = coords.coords_key
-        else:  # CoordsKey type due to the previous assertion
-            coords_key = coords
-    else:
-        coords_key = ME.CoordsKey(input.D)
-    return coords_key
 
 class _(LRPPassLayer):
     #Add layer classes here to ignore them
